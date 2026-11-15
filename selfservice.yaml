@@ -1,0 +1,132 @@
+# kubectl apply -f k8s/selfservice.yaml
+#
+# Create secrets first (values not stored in git):
+#   kubectl create ns selfservice
+#   kubectl -n selfservice create secret generic selfservice-secrets \
+#       --from-literal=JENKINS_USER=<user> --from-literal=JENKINS_TOKEN=<api-token> \
+#       --from-literal=GIT_TOKEN=<git-pat>
+#   kubectl -n selfservice create secret docker-registry regcred \
+#       --docker-server=<registry> --docker-username=<u> --docker-password=<p>
+apiVersion: v1
+kind: Namespace
+metadata: { name: selfservice }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: selfservice-portal, namespace: selfservice }
+---
+# Build-side permissions (own namespace only)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: selfservice-builder, namespace: selfservice }
+rules:
+  - { apiGroups: [batch], resources: [jobs], verbs: [create, get, delete] }
+  - { apiGroups: [""], resources: [pods], verbs: [list] }
+  - { apiGroups: [""], resources: [pods/log], verbs: [get] }
+  - { apiGroups: [""], resources: [secrets], resourceNames: [regcred], verbs: [get] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: selfservice-builder, namespace: selfservice }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: selfservice-builder }
+subjects: [{ kind: ServiceAccount, name: selfservice-portal, namespace: selfservice }]
+---
+# Deploy-side permissions (cluster-wide; tighten with ALLOWED_NS_REGEX + admission policy)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata: { name: selfservice-deployer }
+rules:
+  - { apiGroups: [""], resources: [namespaces], verbs: [get, create] }
+  - { apiGroups: [""], resources: [secrets], verbs: [create, patch] }             # registry pull secret copy
+  # kinds users may deploy via their zip's k8s/ folder (keep in sync with ALLOWED_KINDS)
+  - { apiGroups: [""], resources: [services, configmaps, persistentvolumeclaims], verbs: [get, create, patch] }
+  - { apiGroups: [apps], resources: [deployments, statefulsets], verbs: [get, create, patch] }
+  - { apiGroups: [batch], resources: [cronjobs], verbs: [get, create, patch] }
+  - { apiGroups: [networking.k8s.io], resources: [ingresses], verbs: [get, create, patch] }
+  - { apiGroups: [autoscaling], resources: [horizontalpodautoscalers], verbs: [get, create, patch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata: { name: selfservice-deployer }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: selfservice-deployer }
+subjects: [{ kind: ServiceAccount, name: selfservice-portal, namespace: selfservice }]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: selfservice-config, namespace: selfservice }
+data:
+  JENKINS_URL: "https://jenkins.example.com"
+  JENKINS_JOB: "stack-provisioner"          # or "folder/pipeline-name"
+  GIT_REPO_URL: "https://git.example.com/org/stack-templates.git"
+  TEMPLATE_BRANCH: "stack-templates"
+  TEMPLATES_DIR: "templates"
+  REGISTRY: "myregistry.azurecr.io/selfservice"
+  REGISTRY_SECRET: "regcred"
+  ALLOWED_NS_REGEX: "^team-[a-z0-9-]+$"     # restrict where users can deploy
+  MAX_REPLICAS: "5"
+  CONTEXT_ROOT: "/contexts"
+  CONTEXT_PVC: "selfservice-contexts"
+  MAX_ZIP_MB: "50"
+  ALLOWED_KINDS: "Deployment,StatefulSet,Service,ConfigMap,Ingress,HorizontalPodAutoscaler,PersistentVolumeClaim,CronJob"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: selfservice-contexts, namespace: selfservice }
+spec:
+  accessModes: [ReadWriteOnce]      # fine: build Jobs are pinned to the portal's node via podAffinity
+  resources: { requests: { storage: 5Gi } }
+  # storageClassName: <your-class>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: selfservice-portal, namespace: selfservice }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: selfservice-portal } }
+  template:
+    metadata: { labels: { app: selfservice-portal } }
+    spec:
+      serviceAccountName: selfservice-portal
+      securityContext: { fsGroup: 10001 }   # portal runs as uid 10001; lets it write to the PVC
+      volumes:
+        - name: contexts
+          persistentVolumeClaim: { claimName: selfservice-contexts }
+      containers:
+        - name: portal
+          image: myregistry.azurecr.io/selfservice-portal:1.0.0   # <- your built image
+          ports: [{ containerPort: 8501 }]
+          volumeMounts:
+            - { name: contexts, mountPath: /contexts }
+          envFrom:
+            - configMapRef: { name: selfservice-config }
+            - secretRef: { name: selfservice-secrets }
+          readinessProbe: { httpGet: { path: /_stcore/health, port: 8501 } }
+          livenessProbe: { httpGet: { path: /_stcore/health, port: 8501 }, initialDelaySeconds: 15 }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          securityContext: { allowPrivilegeEscalation: false, runAsNonRoot: true }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: selfservice-portal, namespace: selfservice }
+spec:
+  selector: { app: selfservice-portal }
+  ports: [{ port: 80, targetPort: 8501 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: selfservice-portal
+  namespace: selfservice
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"   # Streamlit websockets
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Add SSO here, e.g. oauth2-proxy auth-url/auth-signin annotations
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: selfservice.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: selfservice-portal, port: { number: 80 } } } }
